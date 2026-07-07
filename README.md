@@ -15,7 +15,6 @@ wiiu_ref/          Wii U format probes, GX2 texture tiling, ipak authoring, tech
 tools/
   ff_decrypt.py    decrypt/decompress any T6 fastfile (PC v147 / WiiU v148 / X360 v146)
   salsa20.py       stream cipher used by the fastfile format
-  ref_oat/src/     the EXTENDED OpenAssetTools source (our Wii U console read/write additions)
 WiiU_FF_Studio/    the desktop GUI (tkinter) for the flat conversions + console tools
 docs/              format / reverse-engineering findings (how the conversion works)
 ```
@@ -44,11 +43,6 @@ oracle. Key modules:
 - `rpl_sigpatch.py` — patch a T6 engine RPL to load custom (zeroed-signature) fastfiles.
 - `*_findings.md` — the mechanism notes for each area (read these to understand the formats).
 
-### `tools/ref_oat/src/` — extended OpenAssetTools
-The upstream OAT unlinker/linker with **added Wii U console read + write paths** (T6). Our additions
-of interest: `ZoneWriting/Game/T6/ConsoleWriterT6.{h,cpp}`, `ConsoleSiegeSkinTail.h`,
-`ZoneLoading/.../*console*`. Build with the upstream OAT toolchain (premake/VS); the generated
-`build/` tree and codegen output are regenerable and were excluded from this snapshot.
 
 ### `WiiU_FF_Studio/` — desktop GUI
 tkinter front-end (pure stdlib, freezes to a single EXE). Pages: fastfile↔zone, batch convert,
