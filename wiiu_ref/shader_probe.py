@@ -222,7 +222,12 @@ def parse_technique(d, t):
 def parse_techset(d, o):
     slots = [u32(d, o + 8 + i*4) for i in range(32)]
     c = Cur(d, o + 136)
-    c.cstr(160)
+    # The techset name (ptr @o+0) is emitted inline (right after the 136-byte
+    # body) ONLY when it FOLLOWs. When it is an ALIAS (a shared name, e.g.
+    # menu/loadscreen techsets on the patch zones) there is no inline string —
+    # reading one over-consumes into the first technique and desyncs the walk.
+    if u32(d, o) == FOLLOW:
+        c.cstr(160)
     ntech = 0
     for v in slots:
         if v == FOLLOW:

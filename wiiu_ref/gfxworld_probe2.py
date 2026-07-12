@@ -169,6 +169,19 @@ def walk(p, stop=None):
         p.o += g(28) * 4
         p.mark('streamInfo.leafRefs x%d' % g(28))
     if g(36) in PTRS:                       # skyBoxModel XString — inline ONLY when FOLLOWING
+        # streamInfo's serialized extent can exceed the counts by a small
+        # variable amount (dockside: +20; raid: +0 — the CAVEATS "-16/-20"
+        # quirk). The inline sky string is the first hard re-sync point:
+        # scan up to 48 bytes for the printable NUL-terminated name start.
+        # (Un-resynced this desynced the whole dockside zone walk @758.)
+        for adj in range(48):
+            q = p.o + adj
+            e2 = p.d.index(b'\x00', q)
+            if e2 > q and all(0x20 <= b_ < 0x7f for b_ in p.d[q:e2]) \
+                    and e2 - q >= 4 and (q == p.o or p.d[q - 1] not in
+                                         range(0x20, 0x7f)):
+                p.o = q
+                break
         s = p.cstr()                         # (alias/null => 0 bytes, e.g. raid). Loaded by the
         p.mark('skyBoxModel', repr(s))       # engine right after streamInfo, before sunLight.
     if g(256) in PTRS:
@@ -193,6 +206,21 @@ def walk(p, stop=None):
 
     # ---- cells ----
     if g(392) in PTRS:
+        # RESYNC: the region chain from streamInfo to here can drift by small
+        # map-specific amounts (dockside serializes planeCount-1 planes; the
+        # streamInfo counts understate by 0/20). Cells carry verifiable world
+        # bounds — align on the offset where the first cells' bounds parse.
+        def _cells_score(base):
+            n = min(cellCount, 4)
+            return sum(1 for i in range(n)
+                       if p.xyz_ok(base + i * 48) and p.xyz_ok(base + i * 48 + 12))
+        if _cells_score(p.o) < min(cellCount, 4):
+            best = (p.o, _cells_score(p.o))
+            for dlt in range(-64, 68, 4):
+                sc = _cells_score(p.o + dlt)
+                if sc > best[1]:
+                    best = (p.o + dlt, sc)
+            p.o = best[0]
         cb = p.o
         p.o += cellCount * 48
         bad = 0

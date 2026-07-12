@@ -21,6 +21,10 @@ PRIM = {
 }
 PTR = (4, 4)  # 32-bit pointer
 
+# 64-bit scalar base types; on console these align to 4 (see type_info). Kept narrow to
+# scalars so structs/unions (e.g. custom_m128) retain their computed alignment.
+_SCALAR64 = {'int64_t', 'uint64_t', 'long long', 'unsigned long long', 'double'}
+
 
 class Layout:
     def __init__(self, header_path, console=False):
@@ -114,6 +118,14 @@ class Layout:
             return sz * arr, al, True, base, arr
         # resolve base
         sz, al = self._resolve(base)
+        # console (WiiU v148) aligns 64-bit scalars to 4, not 8. Verified against the
+        # genuine zone + menudef_t_t6_load_db.cpp SwapEndianness offsets: e.g. menuDef_t
+        # `gcc_align32(8) uint64_t showBits` sits at +292 on console vs +296 on PC (visibleExp
+        # ends at 292; PC pads to an 8-aligned 296, console does not). The gcc_align32(8) attr
+        # is stripped above, so the only remaining 8-align source is the uint64/int64/double
+        # natural alignment -- clamp it to 4 for console. Structs/unions keep their own align.
+        if self.console and al == 8 and base in _SCALAR64:
+            al = 4
         return sz * arr, al, False, base, arr
 
     def _resolve(self, base):
@@ -173,7 +185,8 @@ class Layout:
             maxal = max(maxal, al)
             bare = re.sub(r'\s*\[\d+\]', '', nm).replace('*', '')
             fields.append({'name': bare, 'offset': foff, 'size': sz,
-                           'align': al, 'is_ptr': is_ptr, 'base': base, 'arr': arr})
+                           'align': al, 'is_ptr': is_ptr, 'base': base, 'arr': arr,
+                           'ptr2': is_ptr and (decl + nm).count('*') >= 2})
         if s['align_attr']:
             maxal = max(maxal, s['align_attr'])
         size = off if is_union else off

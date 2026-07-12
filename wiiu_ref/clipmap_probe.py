@@ -64,7 +64,7 @@ class Cur:
         return s.decode('latin-1', 'replace')
 
 
-def walk(d, b, sizes, e='>'):
+def walk(d, b, sizes, e='>', mat_span=None):
     # endian-aware local readers (shadow the module BE u32/u16 so this works for PC LE too;
     # clipMap_t is PC-identical, so the same walk + sizes apply — only the byte order differs).
     def u32(d, o):
@@ -214,8 +214,24 @@ def walk(d, b, sizes, e='>'):
             if inl:
                 c.mark('dynEntDefList[%d] inline physPresets x%d' % (i, inl))
     if g(316) in PTRS:                      # constraints: PhysConstraint = 168
-        c.skip(g(312) * 168)
-        c.mark('constraints x%d (168 each)' % g(312))
+        ncon = g(312)
+        conbase = c.o
+        c.skip(ncon * 168)
+        c.mark('constraints x%d (168 each)' % ncon)
+        # per-constraint dynamics (OAT array order: all bodies, then each element's
+        # follows): target_bone1 @20 / target_bone2 @36 strings, material @140 —
+        # rope constraints carry a full INLINE Material (e.g. zm_transit techrope).
+        for j in range(ncon):
+            cb = conbase + j * 168
+            if u32(d, cb + 20) in PTRS:
+                c.cstr()
+            if u32(d, cb + 36) in PTRS:
+                c.cstr()
+            if u32(d, cb + 140) in PTRS:
+                if mat_span is None:
+                    raise RuntimeError('inline constraint material needs a consumer')
+                c.o = mat_span(d, c.o)
+        c.mark('constraint dynamics')
     # ropes @324 RUNTIME -> 0 bytes; checksum @328 -> body 332
     return c
 
