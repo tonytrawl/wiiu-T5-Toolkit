@@ -26,7 +26,7 @@ INSERT = 0xFFFFFFFE
 # (SkinnedVertsDef excluded: console adds a trailing u32 / FOLLOW-name divergence.)
 SIMPLE = {
     'StringTable', 'KeyValuePairs', 'RawFile', 'ScriptParseTree', 'LocalizeEntry',
-    'FootstepTableDef', 'LeaderboardDef',
+    'FootstepTableDef', 'LeaderboardDef', 'FxImpactTable',
 }
 # World assets whose PC and console struct layouts are identical (byte-swap convertible).
 # These are the OAT crash points — the native pipeline authors them with correct cross-refs.
@@ -78,14 +78,30 @@ class PCConverter:
         return None                     # target not (yet) registered -> forward ref
 
     def finalize(self):
-        """Patch all block-5 alias fixups now that every region is registered."""
+        """Patch all block-5 alias fixups now that every region is registered.
+        Fixups outside this converter's own regions (targets in complex-type bodies
+        it didn't emit) fall back to `ext_reloc` (the assemble loop's shared Omap)."""
         unresolved = 0
+        ext = getattr(self, 'ext_reloc', None)
+        # encode hook: the assemble loop's Omap._encode maps our-stream offsets
+        # through the loader-simulation runtime map before encoding (pointer pass)
+        enc = getattr(self, 'encode', None) or (lambda co_b5: 0xA0000000 + co_b5 + 1)
+        inv = getattr(self, 'pc_inv', None)
         for out_pos, pc_b5 in self.fixups:
+            if inv is not None:
+                # PC alias values encode PC RUNTIME addresses -> PC stream first
+                pc_b5 = inv.stream(pc_b5)
             co_b5 = self._remap_b5(pc_b5)
             if co_b5 is None:
+                if ext is not None:
+                    v = 0xA0000000 + pc_b5 + 1
+                    nv = ext(v)
+                    if nv != v:
+                        struct.pack_into('>I', self.out, out_pos, nv)
+                        continue
                 unresolved += 1
                 continue
-            struct.pack_into('>I', self.out, out_pos, 0xA0000000 + co_b5 + 1)
+            struct.pack_into('>I', self.out, out_pos, enc(co_b5))
         return unresolved
 
     def _scalar_le(self, base, o):

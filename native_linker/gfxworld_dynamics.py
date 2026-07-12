@@ -179,16 +179,20 @@ def conv_world_vertex(pc_bytes):
       +16     color RGBA8      -> byte-copy (no swap)
       +20     normal 2x u16    -> swap2
       +24..32 uv 2x f32        -> swap4
-      +32     tangent 2x u16   -> swap2 (best-effort; genuine uses a packed repack, ~specular-only,
-                                  visually minor — the only non-exact 4 bytes)
+      +32     tangent          -> cross-lane 1-bit rotate (lighting_repack.conv_tangent,
+                                  POLISH 2026-07-10: raid 162752/162752 byte-exact; the old
+                                  swap2 was wrong on ~99.3% of verts = the "renders darker"
+                                  root cause)
     """
+    import lighting_repack as LR
     n = len(pc_bytes)
     out = bytearray(pc_bytes)
     for b in range(0, n - WORLD_VERT_STRIDE + 1, WORLD_VERT_STRIDE):
         for o in (0, 4, 8, 12, 24, 28):            # 4-byte float fields
             out[b + o:b + o + 4] = pc_bytes[b + o:b + o + 4][::-1]
         # color +16..20 kept verbatim
-        for o in (20, 22, 32, 34):                 # 2-byte fields (normal, tangent)
+        for o in (20, 22):                         # normal 2x u16
             out[b + o:b + o + 2] = pc_bytes[b + o:b + o + 2][::-1]
+        out[b + 32:b + 36] = LR.conv_tangent(pc_bytes[b + 32:b + 36])
     return bytes(out)
 

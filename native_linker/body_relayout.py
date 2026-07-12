@@ -29,12 +29,14 @@ import shader_probe as SP
 import fx_probe as FP
 import xmodel_probe as XP
 import destructibledef_probe as DP
+import xanimparts_probe as XAP
 
 # Solved external delimiters for asset types whose console layout has no structural
 # re-emitter yet. Each returns the END file offset given the body start; the region is
 # copied verbatim (byte-exact for a round-trip). Stage 2/3 replaces these with real
 # structural emission when authoring/synthesis needs it.
 def _techset_end(z, o): return SP.parse_techset(z, o)[0]
+def _xanim_end(z, o):   return XAP.parse_xanim(z, o, '>')[0]   # console 104-B XAnimParts + streamed data
 def _fx_end(z, o):      return FP.parse_fx(z, o)[0]
 def _xmodel_end(z, o):  return XP.parse_xmodel(z, o)[0]
 def _destruct_end(z, o): return DP.parse_destructible(z, o, '>')[0]
@@ -55,6 +57,103 @@ def _material_end(z, o):
     c = XP.Cur(z, o)
     XP.consume_material(z, c)
     return c.o
+
+def _spt_end(z, o):
+    # console ScriptParseTree {name* FOLLOW, len, buffer* FOLLOW} = 12-B body + inline name string
+    # + len-byte script buffer (+1 trailing). The generic walker consumes only the 12-B body (it
+    # can't size the buffer from the `len` field), so a big GSC text blob gets read as dozens of
+    # bogus 12-B SPT assets -> drift. scriptparsetree_probe.parse_spt sizes it exactly.
+    F = 0xffffffff
+    if z[o:o+4] == b'\xff' * 4 and z[o+8:o+12] == b'\xff' * 4:
+        import scriptparsetree_probe as SPT
+        return SPT.parse_spt(z, o, '>')[0]
+    ln = struct.unpack_from('>I', z, o + 4)[0]
+    c = o + 12
+    if struct.unpack_from('>I', z, o)[0] == F:
+        c = z.index(b'\x00', c) + 1
+    if struct.unpack_from('>I', z, o + 8)[0] == F:
+        c += ln + 1
+    return c
+
+def _sndbank_end(z, o):
+    # console SndBank: large inline asset (alias/radverb/duck lists, embedded runtime bank
+    # strings, SndAssetBankEntry array + dataSize blob). sndbank_probe walks it exactly.
+    import sndbank_probe as SB
+    return SB.parse_sndbank(z, o, '>')[0]
+
+def _weapon_end(z, o):
+    # console WeaponVariantDef with an INLINE weapDef (FOLLOWING). The genuine WiiU v148
+    # WeaponDef struct diverges from the OAT T6_Assets.h header (field offsets AND body size),
+    # so neither the generic walker nor a load_db interpreter reproduces its extent (both assume
+    # the PC 2448-B body and drift into the inline reticle/hud material's image pixels). Until the
+    # genuine console WeaponDef layout is reversed, bound the weapon by its trailing structure:
+    # a WeaponVariantDef is followed by its WeaponAttachment asset (szInternalName inline), then
+    # the weapon's RAWFILE cluster (rumble/*). Anchor on the first RAWFILE (name* FOLLOW, sane len,
+    # buffer* FOLLOW, printable inline name), walk back over the attachment's inline name string(s)
+    # and its 284-B body -> weapon end == attachment body start. The weapon body is copied
+    # verbatim with its alias pointers relinked (VERBATIM_RELINK); the WeaponAttachment then walks
+    # generically. VALIDATES the attachment body (szInternalName* == FOLLOW) or raises.
+    F = 0xffffffff
+    def u(p): return struct.unpack_from('>I', z, p)[0]
+    ATT_BODY = 284
+    R = None
+    p = o + 3164                                   # min WeaponVariantDef(716)+WeaponDef(2448) body
+    while p + 16 < len(z):
+        if (u(p) == F and 0 < u(p + 4) < 0x40000 and u(p + 8) == F
+                and 0x20 <= z[p + 12] < 0x7f):
+            # confirm a second rawfile follows within the first's extent+slack (cluster)
+            R = p
+            break
+        p += 1
+    if R is None:
+        raise RuntimeError('WeaponVariantDef: no trailing RAWFILE cluster after 0x%x' % o)
+    # walk back over the attachment's inline name string(s) directly preceding R
+    s = R
+    while s > o and 0x20 <= z[s - 1] < 0x7f:
+        s -= 1
+    # s = start of the last printable run (attachment szInternalName). Skip a preceding
+    # szDisplayName string if present (another printable run + its null).
+    att_body = s - ATT_BODY
+    if not (o < att_body < R and u(att_body) == F):
+        # try one extra preceding string (szDisplayName inline before szInternalName)
+        s2 = s - 1
+        while s2 > o and 0x20 <= z[s2 - 1] < 0x7f:
+            s2 -= 1
+        att_body = s2 - ATT_BODY
+        if not (o < att_body < R and u(att_body) == F):
+            raise RuntimeError('WeaponVariantDef: attachment body not found before 0x%x' % R)
+    return att_body
+
+def _fonticon_end(z, o):
+    # console FontIcon (fonticon_t6_load_db). 20-B body {name*, numEntries, numAliasEntries,
+    # fontIconEntry*, fontIconAlias*}. The generic walker mis-sizes it (it has NO structural
+    # model for the per-entry inline sub-tree) and slurps to EOF. Layout per the load_db:
+    #   name XString (inline if FOLLOW)
+    #   fontIconEntry[] : first the whole 24-B array block (FontIconName{string*,hash},
+    #     Material* handle, size, xScale, yScale), THEN per-entry sub-data in order:
+    #     the FontIconName.string (inline cstr if FOLLOW) + a full inline console Material
+    #     (if fontIconMaterialHandle is FOLLOW/INSERT; an aliased handle has no inline data).
+    #   fontIconAlias[] : numAliasEntries x 20 B  (Wii U console FontIconAlias is 20 B, NOT the
+    #     PC 8-B {aliasHash,buttonHash} -- measured byte-exact: patch_mp buttons.csv alias run =
+    #     1960 B / 98 = 20, and the next asset's Material header lands exactly at end.)
+    F = 0xffffffff
+    def u(p): return struct.unpack_from('>I', z, p)[0]
+    name_p, num, num_alias, entry_p, alias_p = struct.unpack_from('>IIIII', z, o)
+    c = o + 20
+    if name_p in XP.PTRS:
+        c = z.index(b'\x00', c) + 1
+    if entry_p in XP.PTRS:
+        arr = c
+        c += 24 * num
+        for i in range(num):
+            e = arr + 24 * i
+            if u(e + 0) in XP.PTRS:            # FontIconName.string inline
+                c = z.index(b'\x00', c) + 1
+            if u(e + 8) in XP.PTRS:            # fontIconMaterialHandle inline Material
+                cc = XP.Cur(z, c); XP.consume_material(z, cc); c = cc.o
+    if alias_p in XP.PTRS:
+        c += 20 * num_alias
+    return c
 
 def _gwmp_end(z, o):
     # GameWorldMp {alias name, PathData}. gameworldmp_probe walker, console node_size=144.
@@ -97,6 +196,53 @@ def _comworld_end(z, o):
         p += 168
     return z.index(b'\x00', p) + 1     # trailing name c-string
 
+def _menulist_end(z, o):
+    # console MenuList: the WiiU (v148) menu graph — menuDef_t/itemDef_s/windowDef_t and the
+    # ExpressionStatement/inline-Material sub-tree — does NOT match the T6 load_db's console
+    # (SwapEndianness) FillStruct offsets: the genuine menuDef_t body is 424 B (not the load_db's
+    # 392), window.name is the first dynamic string, and itemCount/expression fields sit at
+    # offsets the load_db doesn't describe (verified on patch_mp "ui/default.menu": body @0x9726
+    # ends at 0x98ce where window.name "default_menu" begins, with an inline material + an item
+    # "@MENU_MENU_COULDNT_BE_FOUND" following). Re-deriving that whole sub-graph from one mostly
+    # -empty stub is unreliable, and menus are copied UNCHANGED for the mapsTable relink — so bound
+    # the MenuList like the other hard console assets (GfxWorld/techset/XModel) and copy verbatim.
+    #
+    # Bound structurally where possible, else by the next asset's header.
+    # MenuList body {name* FOLLOW, menuCount, menus** FOLLOW} + inline name string, then (if
+    # menuCount>0) menuCount menuDef pointers + inline menuDef graphs.
+    #  * menuCount == 0 (empty menulist, common on the TU zm splitscreen HUDs): body is just the
+    #    12-B header + the inline name -> bound EXACTLY, no scan.
+    #  * menuCount  > 0: the inline menuDef sub-graph has no structural re-emitter (genuine WiiU
+    #    menuDef_t is 424 B and diverges from the load_db); bound at the NEXT asset start. In these
+    #    zones a MenuList is always followed by another MenuList or a StringTable, both with a
+    #    distinctive inline name: MenuList {name* F, menuCount 0..64, menus* F} + "<ui...>.txt", or
+    #    StringTable {name* F, cols<64, rows<4096, values* F, cellIndex* F} + "<path>.csv". Byte-step
+    #    (console bodies are not 4-aligned). ".txt" (not ".menu") avoids matching menuDef window
+    #    names inside the graph.
+    F = 0xffffffff
+    def u(p): return struct.unpack_from('>I', z, p)[0]
+    name_p, count, menus_p = u(o), u(o + 4), u(o + 8)
+    c = o + 12
+    if name_p in (F, zs.INSERT):
+        c = z.index(b'\x00', c) + 1              # inline name string
+    if count == 0:
+        return c
+    p = c
+    while p + 24 <= len(z):
+        if u(p) == F:
+            # StringTable? {name* F, cols<64, rows<4096, values* F, cellIndex* F} + ".csv"
+            if u(p + 4) < 64 and u(p + 8) < 4096 and u(p + 12) == F and u(p + 16) == F:
+                nm = z[p + 20:p + 20 + 64]; e = nm.find(b'\x00')
+                if e > 4 and b'.csv' in nm[:e] and all(32 <= ch < 127 for ch in nm[:e]):
+                    return p
+            # next MenuList? {name* F, menuCount 0..64, menus* F} + ".txt"
+            if u(p + 8) == F and u(p + 4) <= 64:
+                nm = z[p + 12:p + 12 + 64]; e = nm.find(b'\x00')
+                if 4 < e < 64 and b'.txt' in nm[:e] and all(32 <= ch < 127 for ch in nm[:e]):
+                    return p
+        p += 1
+    raise RuntimeError('MenuList: no following MenuList(.txt)/StringTable(.csv) header after 0x%x' % o)
+
 DELIMITERS = {
     'MaterialTechniqueSet': _techset_end,
     'FxEffectDef': _fx_end,
@@ -104,9 +250,15 @@ DELIMITERS = {
     'DestructibleDef': _destruct_end,
     'GfxLightDef': _lightdef_end,
     'Material': _material_end,
+    'FontIcon': _fonticon_end,
+    'WeaponVariantDef': _weapon_end,
+    'SndBank': _sndbank_end,
+    'ScriptParseTree': _spt_end,
     'GfxImage': _image_end,
     'GfxWorld': _gfxworld_end,
     'GameWorldMp': _gwmp_end,
+    'MenuList': _menulist_end,
+    'XAnimParts': _xanim_end,   # struct_layout has the PC 92-B body; console is 104-B (xanimparts_probe)
     # ComWorld is handled by the GENERIC walker (console layout == PC), reached via the
     # pre-check recovery that fixes the destructibledef under-read before it.
 }
@@ -182,6 +334,16 @@ class ReEmitter:
         self.w = writer
         self.src = 0                 # source file cursor (mirrors walker's cur)
         self.omap = {}               # source block-5 offset -> writer block-5 offset
+        # delta != 0 marks an EDIT pass: emit_verbatim then relinks its body's alias words via
+        # omap (a no-edit round-trip keeps delta=0 and stays byte-identical). The EditEmitter
+        # runs two passes so omap is complete before the relinking pass (resolves forward refs).
+        self.delta = 0
+        # EDIT threshold: every block-5 offset >= shift_from moves by +delta. Used to relink
+        # KNOWN structural pointer fields (emit_body / emit_ptr2 / emit_array), which is both
+        # correct and complete -- omap alone MISSES targets that aren't registered asset starts,
+        # e.g. StringTable cells aliasing a shared string POOL. (Verbatim assets can't tell a
+        # pointer from data, so they stay on the conservative omap path.)
+        self.shift_from = 0
         # helper walker for scalar reads / count & condition eval / followers
         self.wk = W.Walker(zone, layout, zc, [0] * 8)
 
@@ -192,15 +354,34 @@ class ReEmitter:
         self.omap[src_file - B5_BASE] = self.w.block_size[self.w.cur_block]
 
     def remap_ptr(self, v):
-        """Return the value to WRITE for a source pointer word v."""
+        """Relink a KNOWN structural pointer field (emit_body / emit_ptr2 / emit_array).
+        Deterministic threshold: a block-5 alias whose offset is at/after the insertion point
+        moves by +delta. This is correct AND complete for real pointers -- including ones that
+        target a shared string pool interior (not a registered asset start, so omap can't see
+        it). Safe from data false-positives because it's only ever applied to fields the struct
+        layout marks as pointers. delta=0 (no-edit) => identity."""
         if v in (zs.FOLLOW, zs.INSERT, 0):
             return v
         if not (0xA0000000 <= v < 0xC0000000):
             return v                 # not an alias-encoded value: raw data / handle
         blk, off = zs.decode_ptr(v)
+        if blk == zs.BLOCK_VIRTUAL and self.delta and off >= self.shift_from:
+            return zs.encode_ptr(blk, off + self.delta)
+        return v
+
+    def remap_ptr_omap(self, v):
+        """Conservative relink for VERBATIM assets (blind 4-aligned scan): only rewrite a word
+        whose decoded offset is a genuine REGISTERED target (self.omap), so shader/pixel/audio
+        data that merely resembles an alias is left untouched. Misses pool-interior targets, but
+        console verbatim assets reference asset starts, not string-pool interiors."""
+        if v in (zs.FOLLOW, zs.INSERT, 0):
+            return v
+        if not (0xA0000000 <= v < 0xC0000000):
+            return v
+        blk, off = zs.decode_ptr(v)
         if blk == zs.BLOCK_VIRTUAL and off in self.omap:
             return zs.encode_ptr(blk, self.omap[off])
-        return v                     # target not (yet) seen: carry through unchanged
+        return v
 
     # ---- copy a struct body to the writer, patching its pointer fields ----
     def emit_body(self, struct_name, src_file):
@@ -227,11 +408,53 @@ class ReEmitter:
         self.w.write_bytes(self.z[self.src:end + 1])
         self.src = end + 1
 
+    # ---- emit an inline asset (ASSET_STRUCTS reached by a FOLLOW/INSERT pointer,
+    # e.g. windowDef.background Material, TracerDef.material). The walker sizes these
+    # with its asset_span consumer; here we bound the asset with the solved DELIMITER
+    # and copy it verbatim (byte-exact for a round-trip). Returns True if handled. --
+    def emit_inline_asset(self, base):
+        delim = DELIMITERS.get(base)
+        if delim is None:
+            return False
+        end = delim(self.z, self.src)
+        self.emit_verbatim(self.src, end)
+        return True
+
+    # ---- emit a double-pointer array (T** with count N): N pointer slots, then per
+    # FOLLOW/INSERT slot one element (string / inline asset / struct body+dynamics).
+    # Mirrors walker._follow_one's ptr2 branch. --
+    def emit_ptr2(self, base, count, d, c):
+        slots = self.src
+        # emit the N pointer slots (aliases remapped, FOLLOW/null kept)
+        raw = bytearray(self.z[slots:slots + count * 4])
+        for i in range(count):
+            v = struct.unpack_from('>I', raw, i * 4)[0]
+            struct.pack_into('>I', raw, i * 4, self.remap_ptr(v))
+        self.register(slots)
+        self.w.write_bytes(bytes(raw))
+        self.src = slots + count * 4
+        for i in range(count):
+            m2 = struct.unpack_from('>I', self.z, slots + i * 4)[0]
+            if m2 not in (W.FOLLOW, W.INSERT):
+                continue
+            if d.get('string'):
+                self.emit_cstring()
+            elif base in W.ASSET_STRUCTS:
+                if not self.emit_inline_asset(base):
+                    self.emit_array(base, 1)
+            elif base in self.L.structs:
+                self.emit_array(base, 1)
+            else:
+                sz, _ = self.L._resolve(base)
+                self.register(self.src)
+                self.w.write_bytes(self.z[self.src:self.src + sz])
+                self.src += sz
+
     # ---- follow one struct's dynamic children (mirrors follow_dynamics) ---
-    def follow(self, struct_name, body_src, ctx):
+    def follow(self, struct_name, body_src, ctx, alias=None):
         c = dict(ctx)
         self.wk.read_scalars(struct_name, body_src, c)
-        for nm, f, d in self.wk.followers(struct_name):
+        for nm, f, d in self.wk.followers(struct_name, alias):
             fo = body_src + f['offset']
             base = f['base']
 
@@ -258,9 +481,19 @@ class ReEmitter:
                         self.emit_array(base, cnt)
                 continue
 
-            # embedded (non-pointer) struct: recurse into its pointers, same body region
-            if not f.get('is_ptr') and base in self.L.structs and f['arr'] == 1:
-                self.follow(base, fo, c)
+            # embedded (non-pointer) struct: recurse into its pointers, same body
+            # region. A FIXED array (arr>1, e.g. PhysConstraints.data[16]) recurses
+            # PER ELEMENT — each element's own pointer followers (target_bone1/2 @+20/
+            # +36, material @+140) emit in element order, matching the load_db's
+            # LoadArray_PhysConstraint. Previously arr>1 embedded arrays were dropped
+            # entirely, so their inline followers never emitted -> walk desync on the
+            # patch zones (PhysConstraints is a top-level asset there). Pass alias=nm so
+            # a union member (e.g. itemDef_s.typeData -> itemDefData_t) picks up its
+            # path-keyed directives (the type-conditioned textDef/imageDef pointer).
+            if not f.get('is_ptr') and base in self.L.structs:
+                esz = self.wk.gs(base)['size']
+                for i in range(max(f['arr'], 1)):
+                    self.follow(base, fo + i * esz, c, alias=nm)
                 continue
             if not f.get('is_ptr'):
                 continue
@@ -270,10 +503,25 @@ class ReEmitter:
                 continue
             if marker in (0,) or (marker not in (W.FOLLOW, W.INSERT)):
                 continue             # null or alias -> no inline child
+            # double pointer (T** with count N, e.g. MenuList.menus, menuDef_t.items, and
+            # ddlEnumDef_t.members = `const char** members` which is ptr2 AND string). MUST be
+            # checked BEFORE the plain-string case: a ptr2 string field is an ARRAY of string
+            # pointers (emit N slots then N cstrings via emit_ptr2), not a single cstring. The
+            # walker orders it the same way (_follow_one ptr2 branch precedes its string case).
+            if f.get('ptr2'):
+                count = self.wk.eval_count(d['count'], c) if d.get('count') else 1
+                if count > 0:
+                    self.emit_ptr2(base, count, d, c)
+                continue
             if d.get('string'):
                 self.emit_cstring(); continue
-            if d.get('assetref'):
-                continue
+            # single FOLLOW/INSERT pointer to an asset-typed struct: an inline asset
+            # follows (e.g. windowDef.background Material). Bound via delimiter, verbatim.
+            if base in W.ASSET_STRUCTS or d.get('assetref'):
+                if self.emit_inline_asset(base):
+                    continue
+                if d.get('assetref'):
+                    continue
             count = self.wk.eval_count(d['count'], c) if d.get('count') else 1
             if count <= 0:
                 continue
@@ -308,15 +556,28 @@ class ReEmitter:
 
     # ---- emit one top-level asset ----------------------------------------
     def emit_verbatim(self, src_file, end):
-        """Copy [src_file, end) as-is. Used for assets whose console layout has a
-        solved external delimiter (techset/GX2 shaders) but no structural re-emitter
-        yet. Byte-exact for a round-trip (offsets preserved); Stage 2/3 replaces
-        these with real structural emission for authoring/synthesis."""
+        """Copy [src_file, end) for assets whose console layout has a solved delimiter but
+        no structural re-emitter. Byte-exact for a round-trip. For an EDIT (delta!=0), the
+        body's alias pointers still need relinking: relink every 4-aligned block-5 alias word
+        through remap_ptr, which ONLY rewrites words whose decoded offset is a genuine
+        registered target (self.omap) -- data coincidences (shader bytecode, pixels, audio,
+        floats) decode to unregistered offsets and are left untouched. Requires a complete
+        omap (2-pass: see relink_pass), so forward cross-asset aliases resolve too."""
         if end <= src_file or end > len(self.z):
             raise RuntimeError('delimiter returned out-of-range end 0x%x (start 0x%x, zone 0x%x)'
                                % (end, src_file, len(self.z)))
         self.register(src_file)
-        self.w.write_bytes(self.z[src_file:end])
+        if self.delta:
+            raw = bytearray(self.z[src_file:end])
+            n = (end - src_file) & ~3
+            for fo in range(0, n, 4):
+                v = struct.unpack_from('>I', raw, fo)[0]
+                rv = self.remap_ptr_omap(v)
+                if rv != v:
+                    struct.pack_into('>I', raw, fo, rv)
+            self.w.write_bytes(bytes(raw))
+        else:
+            self.w.write_bytes(self.z[src_file:end])
         self.src = end
         return end
 

@@ -10,7 +10,8 @@ The console layout drops the fields that only exist for the D3D11 runtime:
     * MaterialInfo   48 -> 40 B   : drops `surfaceFlags` (u32 @ PC off 36) + trailing pad;
                                     `contents` (PC @40) moves to console @36 and is copied
                                     VERBATIM (the linker does NOT byte-swap it). drawSurf IS kept
-                                    (8-byte-swapped as a packed u64). All other scalars byte-swap.
+                                    and is ALSO VERBATIM (352/352 raid GfxWorld inline-material
+                                    oracle, 2026-07-10). All other scalars byte-swap.
     * stateBitsEntry char[36] -> char[32] : mirrors MaterialTechniqueSet.techniques 36 -> 32
                                     (per-technique state-bits index; console technique enum is a
                                     32-slot reordered subset of PC's 36 — a raw truncation, adequate
@@ -41,6 +42,12 @@ PTRS = (FOLLOW, INSERT)
 
 PC_MAT_SIZE = 112
 CO_MAT_SIZE = 104
+
+# Assemble-installed resolver for INLINE techsets inside materials:
+# callable(pc_zone_bytes, pc_inline_techset_off) -> console techset blob bytes
+# (Track B substitute) or None. When set, convert_material EMITS the blob in
+# place of the PC DXBC techset (console loadability requirement).
+INLINE_TECHSET_HOOK = None
 PC_SB_SIZE = 20          # GfxStateBits on PC
 CO_SB_SIZE = 8           # GfxStateBits on console (loadBits[2] only)
 TEXDEF_SIZE = 16
@@ -55,6 +62,45 @@ PC_IMG_BODY = 64
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'wiiu_ref'))
 import ipak as _IP
+
+# Optional resolver for STREAMED images: callable(name_hash) -> iwi dict
+# (gx2_format/width/height/mips/blob, as from ipak.PcImageSource) or None. When set,
+# streamed image bodies are built via ipak_stream.build_streamed_body (real dims,
+# GX2 format, ipak part-hash table) instead of the metadata-less stub. Required for
+# the image to actually stream on console (hw-confirmed 2026-07-09: stub body =>
+# checkerboard, the engine never opens the ipak).
+IMAGE_SOURCE = None
+
+# A1-scoped resolver for XMODEL-INLINE-material images ONLY (skybox_<map> and the
+# other inline-pixel droppers). Kept SEPARATE from the global IMAGE_SOURCE, which
+# corrupts the GfxWorld materialMemory path (16,734 unres:GfxWorld when set globally).
+# Consulted by convert_image ONLY while XMODEL_INLINE_ACTIVE is set (parse_xmodel_pc
+# brackets its convert_material call). callable(name_hash)->iwi dict|None over the PC
+# SOURCE ipaks. When it resolves, the image is emitted INLINE (build_inline_body,
+# streaming=0) to match genuine (genuine ships skybox_mp_raid inline, 512x512, 1.5MB).
+XMODEL_IMAGE_SOURCE = None
+XMODEL_INLINE_ACTIVE = False
+
+# A1 discriminator (2026-07-12): genuine ships an XModel-inline-material image INLINE
+# (resident, streaming=0) iff it is NOT present in the map's streaming ipak; otherwise it
+# STREAMS it. Type/semantic is NOT a clean signal (same combos appear in both sets) —
+# IPAK MEMBERSHIP is. Set by produce_container to callable(name_hash)->bool (True == resident
+# == inline). When None, defaults to resident=True (legacy over-inline; clears the null but
+# balloons the zone). Consulted ONLY inside the XMODEL_INLINE_ACTIVE branch.
+RESIDENT_IMAGE_TEST = None
+
+# Streamed-body style bytes (delayLoadPixels, streaming). Map images use (1, 1)
+# (mp_raid byte-exact); frontend/menu images use (0, 2) (dlc0 load-zone oracles).
+STREAMED_STYLE = (1, 1)
+
+# console T6 ImageFormat <- GX2 (inverse of ipak_stream.T6_TO_GX2); the PC zone's
+# format byte uses the PC enum and must NOT be copied through.
+GX2_TO_T6 = {0x31: 0x6, 0x32: 0x9, 0x33: 0xA, 0x35: 0x14, 0x07: 0x3}
+
+# When set to a list, every streamed-image ipak entry (name_hash, data_hash,
+# payload) built for an embedded body is appended -- lets a caller author an
+# ipak that matches the emitted zones exactly.
+COLLECT_ENTRIES = None
 
 
 class ImageSpanFail(Exception):
@@ -111,6 +157,106 @@ def _swap32(buf, o):
 # =====================================================================
 # forward: PC (LE) material body -> console (BE) bytes
 # =====================================================================
+def convert_image(pc, off, reloc=_default_reloc):
+    """One inline PC GfxImage (80-B body @off, name@72, texture.loadDef@0 -> 12-B header +
+    resourceSize DXT pixels) -> console inline GfxImage stream (328-B GX2 body -> name chars ->
+    tiled pixels), via the validated ipak_stream GX2 builder (build_inline_body). Returns
+    (console_bytes, next_pc_off).
+
+    Streamed PC images (resourceSize==0 / loadDef aliased): emitted as a streaming console body
+    (streaming=1, no inline pixels, 0 part entries) — pixels resolve from the .ipak at runtime by
+    hash. Cube/array images are not expected inline in materials (build_inline_body is 2D)."""
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'wiiu_ref'))
+    import ipak_stream as IS
+
+    b = off
+    name_ptr = _u32(pc, b + 72, True)
+    loaddef_ptr = _u32(pc, b + 0, True)
+    meta = dict(mapType=pc[b + 4], semantic=pc[b + 5], category=pc[b + 6],
+                width=struct.unpack_from('<H', pc, b + 20)[0],
+                height=struct.unpack_from('<H', pc, b + 22)[0],
+                depth=struct.unpack_from('<H', pc, b + 24)[0],
+                levelCount=pc[b + 26],
+                hash=_u32(pc, b + 76, True))
+    src = b + 80
+    name = b''
+    if name_ptr in PTRS:                                  # inline name chars
+        end = pc.index(b'\x00', src)
+        name = pc[src:end + 1]
+        src = end + 1
+    pixels = b''
+    if loaddef_ptr in PTRS:                               # GfxImageLoadDef: 12-B header + pixels
+        meta['levelCount'] = pc[src] or meta['levelCount']
+        meta['format'] = _u32(pc, src + 4, True)
+        rs = _u32(pc, src + 8, True)
+        pixels = pc[src + 12: src + 12 + rs]
+        src += 12 + rs
+    if pixels:
+        body, tiled = IS.build_inline_body(meta, pixels)
+        body = bytearray(body)
+        struct.pack_into('>I', body, 320, name_ptr if name_ptr in PTRS else reloc(name_ptr))
+        out = bytes(body) + name + bytes(tiled)
+    elif XMODEL_INLINE_ACTIVE and XMODEL_IMAGE_SOURCE is not None and \
+            (lambda _i: _i is not None and _i.get('mips') and 'gx2_format' in _i)(
+                XMODEL_IMAGE_SOURCE(meta['hash'])):
+        # A1: XModel-inline streamed image resolves from the PC source ipaks. Scoped: this
+        # branch is unreachable from the GfxWorld materialMemory path (flag stays False there).
+        _iwi = XMODEL_IMAGE_SOURCE(meta['hash'])
+        # DISCRIMINATOR: inline iff resident (absent from the map's streaming ipak); else STREAM.
+        if RESIDENT_IMAGE_TEST is None or RESIDENT_IMAGE_TEST(meta['hash']):
+            # RESIDENT -> emit INLINE (matching genuine, e.g. skybox_mp_raid, 512x512, 1.5MB).
+            meta2 = dict(meta, format=GX2_TO_T6.get(_iwi['gx2_format'], meta.get('format', 0)))
+            pcpix = b''.join(_iwi['blob'][o2:o2 + s2] for (_lw, _lh, o2, s2) in _iwi['mips'])
+            body, tiled = IS.build_inline_body(meta2, pcpix)
+            body = bytearray(body)
+            struct.pack_into('>I', body, 320, name_ptr if name_ptr in PTRS else reloc(name_ptr))
+            struct.pack_into('>I', body, 324, meta['hash'])
+            out = bytes(body) + name + bytes(tiled)
+        else:
+            # STREAMED (in the ipak) -> real streamed body + part-hash entries, NOT the 1x1 stub.
+            # This clears the null WITHOUT ballooning the zone (pixels stay in the ipak).
+            metaS = dict(meta, format=GX2_TO_T6.get(_iwi['gx2_format'], 0))
+            body, _entries = IS.build_streamed_body(metaS, _iwi, meta['hash'])
+            if COLLECT_ENTRIES is not None:
+                for pi, payload in _entries:
+                    COLLECT_ENTRIES.append((meta['hash'], _IP.data_hash(payload, pi), payload))
+            body = bytearray(body)
+            body[159] = STREAMED_STYLE[0]
+            body[171] = STREAMED_STYLE[1]
+            struct.pack_into('>I', body, 320, name_ptr if name_ptr in PTRS else reloc(name_ptr))
+            struct.pack_into('>I', body, 324, meta['hash'])
+            out = bytes(body) + name
+    else:                                                 # streamed: body only, pixels via ipak
+        iwi = IMAGE_SOURCE(meta['hash']) if IMAGE_SOURCE else None
+        if iwi is not None:
+            meta = dict(meta, format=GX2_TO_T6.get(iwi['gx2_format'], 0))
+            body, _entries = IS.build_streamed_body(meta, iwi, meta['hash'])
+            if COLLECT_ENTRIES is not None:
+                for pi, payload in _entries:
+                    COLLECT_ENTRIES.append((meta['hash'], _IP.data_hash(payload, pi),
+                                            payload))
+            body = bytearray(body)
+            body[159] = STREAMED_STYLE[0]
+            body[171] = STREAMED_STYLE[1]
+            struct.pack_into('>I', body, 320,
+                             name_ptr if name_ptr in PTRS else reloc(name_ptr))
+        else:
+            body = bytearray(328)
+            body[0:156] = IS.build_gx2_header(IS.t6_to_gx2(meta.get('format', 0)),
+                                              max(1, meta['width']), max(1, meta['height']),
+                                              max(1, meta['levelCount']))
+            body[156], body[157], body[158], body[159] = meta['mapType'], meta['semantic'], meta['category'], 1
+            struct.pack_into('>HHH', body, 164, 1, 1, 1)
+            body[170] = 1
+            body[171] = 1                                 # streaming
+            struct.pack_into('>I', body, 180, meta.get('format', 0) & 0xFFFFFFFF)
+            struct.pack_into('>I', body, 320, name_ptr if name_ptr in PTRS else reloc(name_ptr))
+            struct.pack_into('>I', body, 324, meta['hash'])
+        out = bytes(body) + name
+    return out, src
+
+
 def convert_material(pc, off, reloc=_default_reloc):
     """Convert one PC material at stream offset `off`. Returns (console_bytes, next_pc_off).
     `console_bytes` is the full console material region (104 B body + trailing dynamic data)."""
@@ -122,7 +268,9 @@ def convert_material(pc, off, reloc=_default_reloc):
     out += struct.pack('>I', reloc(_u32(pc, off + 0, True)))      # name ptr
     out += _swap32(pc, off + 4)                                   # gameFlags
     out += pc[off + 8: off + 16]                                  # pad/sortKey/atlas + pad (bytes)
-    out += struct.pack('>Q', struct.unpack_from('<Q', pc, off + 16)[0])  # drawSurf (packed u64)
+    out += pc[off + 16: off + 24]                                 # drawSurf u64 — VERBATIM
+    #   (352/352 raid GfxWorld inline-material oracle: the linker does NOT
+    #    byte-swap the packed drawSurf; the old >Q swap was wrong)
     out += _swap32(pc, off + 24)                                  # surfaceTypeBits
     out += _swap32(pc, off + 28)                                  # layeredSurfaceTypes
     out += struct.pack('>H', struct.unpack_from('<H', pc, off + 32)[0])  # hashIndex u16
@@ -159,6 +307,25 @@ def convert_material(pc, off, reloc=_default_reloc):
         out += pc[src:end + 1]
         src = end + 1
 
+    # techniqueSet: FOLLOW/INSERT -> a full inline MaterialTechniqueSet asset (DXBC shaders
+    # and all) precedes the texture table (seen in zm map zones, e.g. mc/mtl_t6_attach_fastmag).
+    # The PC DXBC body is never converted; when INLINE_TECHSET_HOOK is set (the
+    # assemble installs a Track B blob resolver) the substitute CONSOLE techset
+    # blob is emitted in its place — REQUIRED for loadability (the console
+    # loader expects an inline techset when the ptr is FOLLOW/INSERT; see
+    # CAVEATS_gfxworld_trackF.md §Integration). Without a hook: span-consume
+    # only (legacy behavior, stream not loadable at that material).
+    if ts in PTRS:
+        import techset_pc
+        nxt = techset_pc.parse_techset_pc(pc, src)
+        if INLINE_TECHSET_HOOK is not None:
+            blob = INLINE_TECHSET_HOOK(pc, src)
+            if blob is None:
+                raise RuntimeError('inline techset: no substitute blob @0x%x'
+                                   % src)
+            out += blob
+        src = nxt
+
     # textureTable[textureCount] : MaterialTextureDef 16 B (identical size)
     if tt in PTRS:
         inline_imgs = []
@@ -171,17 +338,27 @@ def convert_material(pc, off, reloc=_default_reloc):
             if imgv in PTRS:
                 inline_imgs.append(i)
         src += texc * TEXDEF_SIZE
-        # inline images (image ptr FOLLOW): consume their PC span so `src` stays correct. The
-        # console GfxImage (328 B) differs from PC (64 B) — the byte CONVERSION of inline images is
-        # the image-converter's job (TODO); here we only advance past them so the walk resyncs.
-        # Best-effort: if a landmark isn't found (inline-pixel variants not yet fully reversed),
-        # stop advancing rather than raise — Track A's is_pure filter excludes inline-image
-        # materials from byte validation, so this only affects the traversal span for those.
+        # inline images (image ptr FOLLOW): CONVERT each to a console inline GfxImage stream
+        # (328-B GX2 body + name + tiled pixels) via convert_image / the validated ipak_stream
+        # GX2 builder. Fallback: if the PC image is a shape convert_image mis-parses (span
+        # disagreement with the proven pc_image_span), consume-and-skip as before so the walk
+        # still resyncs (that material's image then falls back to streamed/ipak resolution).
         for _ in inline_imgs:
             try:
-                src = pc_image_span(pc, src)
+                expected_end = pc_image_span(pc, src)
             except ImageSpanFail:
-                break
+                expected_end = None
+            try:
+                img_out, nxt = convert_image(pc, src, reloc)
+                if expected_end is not None and nxt != expected_end:
+                    raise ImageSpanFail('convert_image span 0x%x != pc_image_span 0x%x'
+                                        % (nxt, expected_end))
+                out += img_out
+                src = nxt
+            except Exception:
+                if expected_end is None:
+                    break
+                src = expected_end                        # skip (streamed fallback), keep resync
 
     # constantTable[constantCount] : MaterialConstantDef 32 B (identical size)
     if ct in PTRS:
@@ -223,7 +400,7 @@ def deconvert_material(co, off, reloc=_default_reloc):
     put_le(reloc(be32(off + 0)))                     # name
     put_le(be32(off + 4))                            # gameFlags
     out += co[off + 8: off + 16]                     # pad/sortKey/atlas + pad
-    out += struct.pack('<Q', struct.unpack_from('>Q', co, off + 16)[0])  # drawSurf
+    out += co[off + 16: off + 24]                    # drawSurf (VERBATIM both directions)
     put_le(be32(off + 24))                           # surfaceTypeBits
     put_le(be32(off + 28))                           # layeredSurfaceTypes
     out += struct.pack('<H', struct.unpack_from('>H', co, off + 32)[0])  # hashIndex

@@ -135,15 +135,25 @@ def _ptr(v, reloc):
     return struct.pack('>I', v if v in PTRS else reloc(v))
 
 
-def convert_surface_header(pc, o, reloc=_default_reloc):
-    """One PC XSurface header (80 B) -> console header (128 B)."""
+def convert_surface_header(pc, o, reloc=_default_reloc, force_rigid=False):
+    """One PC XSurface header (80 B) -> console header (128 B).
+
+    force_rigid: emit a SKINNED PC surface (flags&2, vertsBlend/tension present) as a GENUINE
+    rigid console surface — clear flags&2 and leave the console blend/skin-stream slots null
+    (bind-pose verts render; no bone deformation). The 3 console Latte skin streams are not
+    derivable from PC data (CAVEATS_nobackbone_boot.md §1); flag-cleared rigid is the load-safe
+    emit. Without force_rigid a skinned surface still raises (byte-parity contexts)."""
     if _u32le(pc, o + 24) in PTRS or _u32le(pc, o + 28) in PTRS:
-        raise NotImplementedError('skinned surface header (flags&2): needs Latte GX2 skin-stream '
-                                  'synthesis (vertsBlend swaps, tension->skin-streams does not)')
+        if not force_rigid:
+            raise NotImplementedError('skinned surface header (flags&2): needs Latte GX2 skin-stream '
+                                      'synthesis (vertsBlend swaps, tension->skin-streams does not)')
     out = bytearray(SURF_CO)
     out[0] = pc[o + 0]                                     # tileMode
     out[1] = pc[o + 1]                                     # vertListCount
-    struct.pack_into('>H', out, 2, _u16le(pc, o + 2))     # flags
+    flags = _u16le(pc, o + 2)
+    if force_rigid:
+        flags &= ~2                                        # clear the skinned bit
+    struct.pack_into('>H', out, 2, flags)                 # flags
     struct.pack_into('>H', out, 4, _u16le(pc, o + 4))     # vertCount
     struct.pack_into('>H', out, 6, _u16le(pc, o + 6))     # triCount
     struct.pack_into('>H', out, 8, _u16le(pc, o + 8))     # baseTriIndex
@@ -195,7 +205,8 @@ def _convert_vertlist(pc, c, vlc, reloc):
     return bytes(out)
 
 
-def convert_xmodel_surfaces(pc, sb, ns, reloc=_default_reloc):
+def convert_xmodel_surfaces(pc, sb, ns, reloc=_default_reloc, marks=None,
+                            co_base=0):
     """Convert the surfs[ns] header block + all per-surface dynamic data.
     `sb` = PC surfs-array offset. Returns (console_bytes, next_pc_off).
     Console layout: ns x 128-B header, then per surface: verts0(24*vc) verts1(8*vc)
@@ -205,7 +216,7 @@ def convert_xmodel_surfaces(pc, sb, ns, reloc=_default_reloc):
     from latte_vertex import pc_vertex_to_console
     out = bytearray()
     for i in range(ns):
-        out += convert_surface_header(pc, sb + i * SURF_PC, reloc)
+        out += convert_surface_header(pc, sb + i * SURF_PC, reloc, force_rigid=True)
     c = [sb + ns * SURF_PC]
     for i in range(ns):
         o = sb + i * SURF_PC
@@ -213,15 +224,17 @@ def convert_xmodel_surfaces(pc, sb, ns, reloc=_default_reloc):
         vc = _u16le(pc, o + 4)
         tc = _u16le(pc, o + 6)
         vlc = pc[o + 1]
-        if _u32le(pc, o + 24) in PTRS or _u32le(pc, o + 28) in PTRS:
-            # skinned pre-verts0 blob: vertsBlend IS a clean u16 byte-swap (PC c001->console 01c0,
-            # same 0x01c0 values, size vb = (vc0+3vc1+5vc2+7vc3)*2, identical both sides). BUT PC's
-            # tensionData (sum(vc)*4 f32) does NOT map: the console replaces it with Latte GX2 skin
-            # streams (size 2*lo16(s28)+2*hi16(s28)+2*s40, scalars @28/@40 — e.g. 16836 B vs PC's
-            # 8492 B tension for viewmodel_hands_cloth). Those hardware skin streams must be
-            # SYNTHESISED (GX2 skinning-vertex RE), not swapped — the real remaining blocker.
-            raise NotImplementedError('skinned surface (flags&2): vertsBlend swaps but console Latte '
-                                      'GX2 skin streams need synthesis — see convert_xmodel_surfaces')
+        # skinned (flags&2) -> EMIT-RIGID (CAVEATS §1): the console Latte GX2 skin streams are not
+        # derivable from PC (vertsBlend swaps cleanly but tension->skin-streams does not; sizes
+        # 2*lo16(s28)+2*hi16(s28)+2*s40 vs PC tension sum(vi)*4). The header above was emitted with
+        # flags&2 CLEARED and null blend/stream slots; here we CONSUME the PC pre-verts0 skinned
+        # blob (vertsBlend + tensionData, sizes per the end-to-end-proven xmodel_pc walk) and emit
+        # nothing for it — bind-pose verts0/verts1 below render the surface rigid.
+        vi = [struct.unpack_from('<h', pc, o + 16 + j * 2)[0] for j in range(4)]
+        if _u32le(pc, o + 24) in PTRS:                # vertsBlend (u16s), pre-verts0
+            c[0] += (vi[0] + 3 * vi[1] + 5 * vi[2] + 7 * vi[3]) * 2
+        if _u32le(pc, o + 28) in PTRS:                # tensionData (f32s), pre-verts0
+            c[0] += (vi[0] + vi[1] + vi[2] + vi[3]) * 4
         if not (flags & 1) and _u32le(pc, o + 32) in PTRS:
             vsrc = c[0]
             c[0] += vc * 32
@@ -229,12 +242,16 @@ def convert_xmodel_surfaces(pc, sb, ns, reloc=_default_reloc):
             for v in range(vc):
                 a, b = pc_vertex_to_console(pc, vsrc + v * 32)
                 v0blk += a; v1blk += b
+            if marks is not None:      # verts0: element-scaled (PC 32 -> co 24)
+                marks.append(('scaled', vsrc, co_base + len(out), vc, 32, 24))
             out += v0blk; out += v1blk
         if _u32le(pc, o + 40) in PTRS:
             out += _convert_vertlist(pc, c, vlc, reloc)
         if _u32le(pc, o + 12) in PTRS:
             tsrc = c[0]
             c[0] += tc * 6
+            if marks is not None:      # triIndices: same size both sides
+                marks.append(('lin', tsrc, co_base + len(out), tc * 6))
             for t in range(tc * 3):
                 out += _sw16(pc, tsrc + t * 2)
     return bytes(out), c[0]
@@ -252,7 +269,15 @@ def convert_xmodel_materialhandles(pc, base, ns, reloc=_default_reloc):
     c = base + ns * 4
     for i in range(ns):
         if _u32le(pc, base + i * 4) in PTRS:
-            mb, c = MC.convert_material(pc, c, reloc)
+            # A1: enable the XModel-inline image source for this inline material so
+            # inline-pixel images (skybox_<map>) emit inline instead of the 1x1 stub.
+            # Scoped so the GfxWorld materialMemory path never sees it.
+            _prev = MC.XMODEL_INLINE_ACTIVE
+            MC.XMODEL_INLINE_ACTIVE = True
+            try:
+                mb, c = MC.convert_material(pc, c, reloc)
+            finally:
+                MC.XMODEL_INLINE_ACTIVE = _prev
             out += mb
     return bytes(out), c
 
@@ -288,6 +313,79 @@ def convert_xmodel_collsurfs(pc, base, ncoll, reloc=_default_reloc):
         if _u32le(pc, cs + 0) in PTRS:                  # collTris* present -> consume+drop
             c += _u32le(pc, cs + 4) * COLLTRI
     return bytes(out), c
+
+
+def convert_xmodel_collmaps(pc, base, ncoll, reloc=_default_reloc):
+    """collmaps chain: ncoll x Collmap(4) then per-collmap followers, mirroring the loader
+    (OAT Load_Collmap -> PhysGeomList(12) -> count x PhysGeomInfo(68) -> per-geom BrushWrapper(96)
+    -> sides(12*n) / verts(12*n) / planes(20*n)). Every struct is identical-layout PC<->console
+    (no SwapEndianness branches in the OAT fills) => structural byte-swap + ptr relocation.
+    Stream order per LoadArray: full array first, THEN each element's followers in order.
+    cplane_s last word (type/signbits/pad) copied verbatim, as in the clipmap cplane rule."""
+    out = bytearray()
+    cm = base                                             # Collmap array: ncoll x {geomList*}
+    for i in range(ncoll):
+        out += _ptr(_u32le(pc, cm + i * 4), reloc)
+    cur = cm + ncoll * 4
+    for i in range(ncoll):
+        if _u32le(pc, cm + i * 4) not in PTRS:
+            continue
+        gl = cur                                          # PhysGeomList(12): count, geoms*, contents
+        count = _u32le(pc, gl)
+        out += _sw32(pc, gl)
+        out += _ptr(_u32le(pc, gl + 4), reloc)
+        out += _sw32(pc, gl + 8)
+        cur = gl + 12
+        if _u32le(pc, gl + 4) not in PTRS:
+            continue
+        ga = cur                                          # count x PhysGeomInfo(68)
+        for g in range(count):
+            go = ga + g * 68
+            out += _ptr(_u32le(pc, go), reloc)            # brush*
+            for w in range(1, 17):                        # type, orientation[3][3], offset, halfLengths
+                out += _sw32(pc, go + w * 4)
+        cur = ga + count * 68
+        for g in range(count):                            # per-geom followers
+            if _u32le(pc, ga + g * 68) not in PTRS:
+                continue
+            bw = cur                                      # BrushWrapper(96)
+            numsides = _u32le(pc, bw + 28)
+            numverts = _u32le(pc, bw + 84)
+            for w in range(8):                            # mins, contents, maxs, numsides
+                out += _sw32(pc, bw + w * 4)
+            out += _ptr(_u32le(pc, bw + 32), reloc)       # sides*
+            for w in range(9, 21):                        # axial_cflags[2][3] + axial_sflags[2][3]
+                out += _sw32(pc, bw + w * 4)
+            out += _sw32(pc, bw + 84)                     # numverts
+            out += _ptr(_u32le(pc, bw + 88), reloc)       # verts*
+            out += _ptr(_u32le(pc, bw + 92), reloc)       # planes*
+            cur = bw + 96
+            if _u32le(pc, bw + 32) in PTRS:               # sides: numsides x cbrushside_t(12)
+                sb = cur
+                for s in range(numsides):
+                    so = sb + s * 12
+                    out += _ptr(_u32le(pc, so), reloc)    # plane*
+                    out += _sw32(pc, so + 4)              # cflags
+                    out += _sw32(pc, so + 8)              # sflags
+                cur = sb + numsides * 12
+                for s in range(numsides):                 # per-side follower: inline cplane_s(20)
+                    if _u32le(pc, sb + s * 12) in PTRS:   # when plane* is FOLLOW
+                        for w in range(4):
+                            out += _sw32(pc, cur + w * 4)
+                        out += pc[cur + 16:cur + 20]      # type/signbits/pad verbatim
+                        cur += 20
+            if _u32le(pc, bw + 88) in PTRS:               # verts: numverts x vec3(12)
+                for w in range(numverts * 3):
+                    out += _sw32(pc, cur + w * 4)
+                cur += numverts * 12
+            if _u32le(pc, bw + 92) in PTRS:               # planes: numsides x cplane_s(20)
+                for s in range(numsides):
+                    po = cur + s * 20
+                    for w in range(4):                    # normal xyz + dist
+                        out += _sw32(pc, po + w * 4)
+                    out += pc[po + 16:po + 20]            # type/signbits/pad verbatim
+                cur += numsides * 20
+    return bytes(out), cur
 
 
 def convert_xmodel_boneinfo(pc, base, nb):
@@ -358,7 +456,7 @@ def convert_xmodel_body(pc, off, reloc=_default_reloc, memusage=None, himip=FOLL
     return bytes(out)
 
 
-def convert_xmodel(pc, off, reloc=_default_reloc, memusage=None):
+def convert_xmodel(pc, off, reloc=_default_reloc, memusage=None, marks=None):
     """Full XModel PC->console driver: body -> bonedata -> surfaces -> materialHandles ->
     collSurfs -> boneInfo -> himipInvSqRadii -> physPreset -> (collmaps/physConstraints raise).
     Returns (console_bytes, next_pc_off).  Skinned surfaces raise NotImplementedError.
@@ -375,7 +473,8 @@ def convert_xmodel(pc, off, reloc=_default_reloc, memusage=None):
     out += bones
     # surfaces
     if _u32le(pc, off + 32) in PTRS:
-        surf, cur = convert_xmodel_surfaces(pc, cur, ns, reloc)
+        surf, cur = convert_xmodel_surfaces(pc, cur, ns, reloc, marks=marks,
+                                            co_base=len(out))
         out += surf
     # materialHandles
     if _u32le(pc, off + 36) in PTRS:
@@ -400,7 +499,8 @@ def convert_xmodel(pc, off, reloc=_default_reloc, memusage=None):
         pp, cur = convert_xmodel_physpreset(pc, cur, reloc)
         out += pp
     if _u32le(pc, off + 224) in PTRS and pc[off + 220]:
-        raise NotImplementedError('collmaps conversion not built')
+        cmb, cur = convert_xmodel_collmaps(pc, cur, pc[off + 220], reloc)
+        out += cmb
     if _u32le(pc, off + 228) in PTRS:
         raise NotImplementedError('inline physConstraints not built')
     return bytes(out), cur

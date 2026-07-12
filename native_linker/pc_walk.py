@@ -36,7 +36,8 @@ def _okptr(v):
     return v in (FOLLOW, 0xFFFFFFFE, 0) or 0xA0000000 <= v < 0xF0000000
 
 
-def walk_pc_zone(path, verbose=False):
+def walk_pc_zone(path, verbose=False, spans=None):
+    """Walk the zone; if `spans` is a list, append (index, type, start, end) per inline asset."""
     PC = open(path, 'rb').read()
     r = pc_zone.PCZoneReader(PC); r.read_string_table(); r.read_asset_list()
     L = struct_layout.Layout(W.HDR, console=False)
@@ -46,6 +47,19 @@ def walk_pc_zone(path, verbose=False):
     wk.u32 = lambda o: struct.unpack_from('<I', PC, o)[0]
     wk._scalar = lambda base, o: (lambda s: PC[o] if s == 1 else
                                   struct.unpack_from('<H' if s == 2 else '<I', PC, o)[0])(L._resolve(base)[0])
+    # span consumers for inline (FOLLOW/INSERT) asset refs inside other assets
+    # (e.g. TracerDef.material -> inline Material, WeaponDef.gunXModel slots)
+    wk.asset_span = {
+        'Material':             lambda c: material_convert.convert_material(PC, c)[1],
+        'GfxImage':             lambda c: material_convert.pc_image_span(PC, c),
+        'XModel':               lambda c: xmodel_pc.parse_xmodel_pc(PC, c),
+        'FxEffectDef':          lambda c: fx_pc.parse_fx_pc(PC, c)[0],
+        'XAnimParts':           lambda c: _XA.parse_xanim(PC, c, '<')[0],
+        'MaterialTechniqueSet': lambda c: techset_pc.parse_techset_pc(PC, c),
+        'GfxLightDef':          lambda c: lightdef_pc.parse_lightdef_pc(PC, c),
+        'SndBank':              lambda c: sndbank_pc.parse_sndbank_pc(PC, c),
+        'DestructibleDef':      lambda c: _DP.parse_destructible(PC, c, '<')[0],
+    }
     cur = r.assets_end
     clean = 0
     drift = None
@@ -87,6 +101,8 @@ def walk_pc_zone(path, verbose=False):
                 cur = wk.walk(root, cur)
         except Exception as e:
             drift = (i, nm, start, 'EXC: %s' % e); break
+        if spans is not None:
+            spans.append((i, nm, start, cur))
         nxt = struct.unpack_from('<I', PC, cur)[0] if cur + 4 <= len(PC) else 0
         if _okptr(nxt):
             clean += 1
